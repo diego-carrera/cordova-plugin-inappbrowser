@@ -63,6 +63,8 @@ import org.apache.cordova.PluginResult;
 import org.json.JSONException;
 import org.json.JSONObject;
 
+
+import java.io.UnsupportedEncodingException;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
@@ -196,6 +198,104 @@ public class InAppBrowser extends CordovaPlugin {
                     callbackContext.sendPluginResult(pluginResult);
                 }
             });
+        }
+        else if (action.equals("postUrl")) {
+          this.callbackContext = callbackContext;
+          final String url = args.getString(0);
+          String t = args.optString(1);
+          if (t == null || t.equals("") || t.equals(NULL)) {
+              t = SELF;
+          }
+          final String target = t;
+          final HashMap<String, Boolean> features = parseFeature(args.optString(2));
+
+          String strPostData = args.getString(3);
+          byte[] _postData;
+          try {
+            _postData = strPostData.getBytes("BASE64");
+          } catch( UnsupportedEncodingException e ) {
+            _postData = strPostData.getBytes();
+          }
+          final byte[] postData = _postData;
+
+          Log.d(LOG_TAG, "target = " + target);
+          Log.d(LOG_TAG, "postData = " + strPostData);
+
+          this.cordova.getActivity().runOnUiThread(new Runnable() {
+              @Override
+              public void run() {
+                  String result = "";
+                  // SELF
+                  if (SELF.equals(target)) {
+                      Log.d(LOG_TAG, "in self");
+                      /* This code exists for compatibility between 3.x and 4.x versions of Cordova.
+                       * Previously the Config class had a static method, isUrlWhitelisted(). That
+                       * responsibility has been moved to the plugins, with an aggregating method in
+                       * PluginManager.
+                       */
+                      Boolean shouldAllowNavigation = null;
+                      if (url.startsWith("javascript:")) {
+                          shouldAllowNavigation = true;
+                      }
+                      if (shouldAllowNavigation == null) {
+                          try {
+                              Method iuw = Config.class.getMethod("isUrlWhiteListed", String.class);
+                              shouldAllowNavigation = (Boolean)iuw.invoke(null, url);
+                          } catch (NoSuchMethodException e) {
+                          } catch (IllegalAccessException e) {
+                          } catch (InvocationTargetException e) {
+                          }
+                      }
+                      if (shouldAllowNavigation == null) {
+                          try {
+                              Method gpm = webView.getClass().getMethod("getPluginManager");
+                              PluginManager pm = (PluginManager)gpm.invoke(webView);
+                              Method san = pm.getClass().getMethod("shouldAllowNavigation", String.class);
+                              shouldAllowNavigation = (Boolean)san.invoke(pm, url);
+                          } catch (NoSuchMethodException e) {
+                          } catch (IllegalAccessException e) {
+                          } catch (InvocationTargetException e) {
+                          }
+                      }
+                      // load in webview
+                      if (Boolean.TRUE.equals(shouldAllowNavigation)) {
+                          Log.d(LOG_TAG, "loading in webview");
+                          webView.loadUrl(url);
+                      }
+                      //Load the dialer
+                      else if (url.startsWith(WebView.SCHEME_TEL))
+                      {
+                          try {
+                              Log.d(LOG_TAG, "loading in dialer");
+                              Intent intent = new Intent(Intent.ACTION_DIAL);
+                              intent.setData(Uri.parse(url));
+                              cordova.getActivity().startActivity(intent);
+                          } catch (android.content.ActivityNotFoundException e) {
+                              LOG.e(LOG_TAG, "Error dialing " + url + ": " + e.toString());
+                          }
+                      }
+                      // load in InAppBrowser
+                      else {
+                          Log.d(LOG_TAG, "loading in InAppBrowser");
+                          result = showWebPagePost(url, features, postData);
+                      }
+                  }
+                  // SYSTEM
+                  else if (SYSTEM.equals(target)) {
+                      Log.d(LOG_TAG, "in system");
+                      result = openExternal(url);
+                  }
+                  // BLANK - or anything else
+                  else {
+                      Log.d(LOG_TAG, "in blank");
+                      result = showWebPagePost(url, features, postData);
+                  }
+
+                  PluginResult pluginResult = new PluginResult(PluginResult.Status.OK, result);
+                  pluginResult.setKeepCallback(true);
+                  callbackContext.sendPluginResult(pluginResult);
+              }
+          });
         }
         else if (action.equals("close")) {
             closeDialog();
@@ -736,6 +836,281 @@ public class InAppBrowser extends CordovaPlugin {
         this.cordova.getActivity().runOnUiThread(runnable);
         return "";
     }
+
+    /**
+     * Display a new browser with the specified URL.
+     *
+     * @param url the url to load.
+     * @param features jsonObject
+     * @param byte[] jsonObject
+     */
+    public String showWebPagePost(final String url, HashMap<String, Boolean> features, final byte[] postData) {
+      Log.d(LOG_TAG, "showWebPagePost");
+        // Determine if we should hide the location bar.
+        showLocationBar = true;
+        showZoomControls = true;
+        openWindowHidden = false;
+        mediaPlaybackRequiresUserGesture = false;
+
+        if (features != null) {
+            Boolean show = features.get(LOCATION);
+            if (show != null) {
+                showLocationBar = show.booleanValue();
+            }
+            Boolean zoom = features.get(ZOOM);
+            if (zoom != null) {
+                showZoomControls = zoom.booleanValue();
+            }
+            Boolean hidden = features.get(HIDDEN);
+            if (hidden != null) {
+                openWindowHidden = hidden.booleanValue();
+            }
+            Boolean hardwareBack = features.get(HARDWARE_BACK_BUTTON);
+            if (hardwareBack != null) {
+                hadwareBackButton = hardwareBack.booleanValue();
+            }
+            Boolean mediaPlayback = features.get(MEDIA_PLAYBACK_REQUIRES_USER_ACTION);
+            if (mediaPlayback != null) {
+                mediaPlaybackRequiresUserGesture = mediaPlayback.booleanValue();
+            }
+            Boolean cache = features.get(CLEAR_ALL_CACHE);
+            if (cache != null) {
+                clearAllCache = cache.booleanValue();
+            } else {
+                cache = features.get(CLEAR_SESSION_CACHE);
+                if (cache != null) {
+                    clearSessionCache = cache.booleanValue();
+                }
+            }
+        }
+
+        final CordovaWebView thatWebView = this.webView;
+
+        // Create dialog in new thread
+        Runnable runnable = new Runnable() {
+            /**
+             * Convert our DIP units to Pixels
+             *
+             * @return int
+             */
+            private int dpToPixels(int dipValue) {
+                int value = (int) TypedValue.applyDimension( TypedValue.COMPLEX_UNIT_DIP,
+                                                            (float) dipValue,
+                                                            cordova.getActivity().getResources().getDisplayMetrics()
+                );
+
+                return value;
+            }
+
+            @SuppressLint("NewApi")
+            public void run() {
+
+                // CB-6702 InAppBrowser hangs when opening more than one instance
+                if (dialog != null) {
+                    dialog.dismiss();
+                };
+
+                // Let's create the main dialog
+                dialog = new InAppBrowserDialog(cordova.getActivity(), android.R.style.Theme_NoTitleBar);
+                dialog.getWindow().getAttributes().windowAnimations = android.R.style.Animation_Dialog;
+                dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
+                dialog.setCancelable(true);
+                dialog.setInAppBroswer(getInAppBrowser());
+
+                // Main container layout
+                LinearLayout main = new LinearLayout(cordova.getActivity());
+                main.setOrientation(LinearLayout.VERTICAL);
+
+                // Toolbar layout
+                RelativeLayout toolbar = new RelativeLayout(cordova.getActivity());
+                //Please, no more black!
+                toolbar.setBackgroundColor(android.graphics.Color.LTGRAY);
+                toolbar.setLayoutParams(new RelativeLayout.LayoutParams(LayoutParams.MATCH_PARENT, this.dpToPixels(44)));
+                toolbar.setPadding(this.dpToPixels(2), this.dpToPixels(2), this.dpToPixels(2), this.dpToPixels(2));
+                toolbar.setHorizontalGravity(Gravity.LEFT);
+                toolbar.setVerticalGravity(Gravity.TOP);
+
+                // Action Button Container layout
+                RelativeLayout actionButtonContainer = new RelativeLayout(cordova.getActivity());
+                actionButtonContainer.setLayoutParams(new RelativeLayout.LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT));
+                actionButtonContainer.setHorizontalGravity(Gravity.LEFT);
+                actionButtonContainer.setVerticalGravity(Gravity.CENTER_VERTICAL);
+                actionButtonContainer.setId(Integer.valueOf(1));
+
+                // Back button
+                ImageButton back = new ImageButton(cordova.getActivity());
+                RelativeLayout.LayoutParams backLayoutParams = new RelativeLayout.LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.MATCH_PARENT);
+                backLayoutParams.addRule(RelativeLayout.ALIGN_LEFT);
+                back.setLayoutParams(backLayoutParams);
+                back.setContentDescription("Back Button");
+                back.setId(Integer.valueOf(2));
+                Resources activityRes = cordova.getActivity().getResources();
+                int backResId = activityRes.getIdentifier("ic_action_previous_item", "drawable", cordova.getActivity().getPackageName());
+                Drawable backIcon = activityRes.getDrawable(backResId);
+                back.setBackground(null);
+                back.setImageDrawable(backIcon);
+                back.setScaleType(ImageView.ScaleType.FIT_CENTER);
+                back.setPadding(0, this.dpToPixels(10), 0, this.dpToPixels(10));
+                back.getAdjustViewBounds();
+
+                back.setOnClickListener(new View.OnClickListener() {
+                    public void onClick(View v) {
+                        goBack();
+                    }
+                });
+
+                // Forward button
+                ImageButton forward = new ImageButton(cordova.getActivity());
+                RelativeLayout.LayoutParams forwardLayoutParams = new RelativeLayout.LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.MATCH_PARENT);
+                forwardLayoutParams.addRule(RelativeLayout.RIGHT_OF, 2);
+                forward.setLayoutParams(forwardLayoutParams);
+                forward.setContentDescription("Forward Button");
+                forward.setId(Integer.valueOf(3));
+                int fwdResId = activityRes.getIdentifier("ic_action_next_item", "drawable", cordova.getActivity().getPackageName());
+                Drawable fwdIcon = activityRes.getDrawable(fwdResId);
+                forward.setBackground(null);
+                forward.setImageDrawable(fwdIcon);
+                forward.setScaleType(ImageView.ScaleType.FIT_CENTER);
+                forward.setPadding(0, this.dpToPixels(10), 0, this.dpToPixels(10));
+                forward.getAdjustViewBounds();
+
+                forward.setOnClickListener(new View.OnClickListener() {
+                    public void onClick(View v) {
+                        goForward();
+                    }
+                });
+
+                // Edit Text Box
+                edittext = new EditText(cordova.getActivity());
+                RelativeLayout.LayoutParams textLayoutParams = new RelativeLayout.LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT);
+                textLayoutParams.addRule(RelativeLayout.RIGHT_OF, 1);
+                textLayoutParams.addRule(RelativeLayout.LEFT_OF, 5);
+                edittext.setLayoutParams(textLayoutParams);
+                edittext.setId(Integer.valueOf(4));
+                edittext.setSingleLine(true);
+                edittext.setText(url);
+                edittext.setInputType(InputType.TYPE_TEXT_VARIATION_URI);
+                edittext.setImeOptions(EditorInfo.IME_ACTION_GO);
+                edittext.setInputType(InputType.TYPE_NULL); // Will not except input... Makes the text NON-EDITABLE
+                edittext.setOnKeyListener(new View.OnKeyListener() {
+                    public boolean onKey(View v, int keyCode, KeyEvent event) {
+                        // If the event is a key-down event on the "enter" button
+                        if ((event.getAction() == KeyEvent.ACTION_DOWN) && (keyCode == KeyEvent.KEYCODE_ENTER)) {
+                          navigate(edittext.getText().toString());
+                          return true;
+                        }
+                        return false;
+                    }
+                });
+
+                // Close/Done button
+                ImageButton close = new ImageButton(cordova.getActivity());
+                RelativeLayout.LayoutParams closeLayoutParams = new RelativeLayout.LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.MATCH_PARENT);
+                closeLayoutParams.addRule(RelativeLayout.ALIGN_PARENT_RIGHT);
+                close.setLayoutParams(closeLayoutParams);
+                forward.setContentDescription("Close Button");
+                close.setId(Integer.valueOf(5));
+                int closeResId = activityRes.getIdentifier("ic_action_remove", "drawable", cordova.getActivity().getPackageName());
+                Drawable closeIcon = activityRes.getDrawable(closeResId);
+                close.setBackground(null);
+                close.setImageDrawable(closeIcon);
+                close.setScaleType(ImageView.ScaleType.FIT_CENTER);
+                back.setPadding(0, this.dpToPixels(10), 0, this.dpToPixels(10));
+                close.getAdjustViewBounds();
+
+                close.setOnClickListener(new View.OnClickListener() {
+                    public void onClick(View v) {
+                        closeDialog();
+                    }
+                });
+
+                // WebView
+                inAppWebView = new WebView(cordova.getActivity());
+                inAppWebView.setLayoutParams(new LinearLayout.LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT));
+                inAppWebView.setId(Integer.valueOf(6));
+                inAppWebView.setWebChromeClient(new InAppChromeClient(thatWebView));
+                WebViewClient client = new InAppBrowserClient(thatWebView, edittext);
+                inAppWebView.setWebViewClient(client);
+                WebSettings settings = inAppWebView.getSettings();
+                settings.setJavaScriptEnabled(true);
+                settings.setJavaScriptCanOpenWindowsAutomatically(true);
+                settings.setBuiltInZoomControls(showZoomControls);
+                settings.setPluginState(android.webkit.WebSettings.PluginState.ON);
+
+                if(android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.JELLY_BEAN_MR1) {
+                    settings.setMediaPlaybackRequiresUserGesture(mediaPlaybackRequiresUserGesture);
+                }
+
+                String overrideUserAgent = preferences.getString("OverrideUserAgent", null);
+                String appendUserAgent = preferences.getString("AppendUserAgent", null);
+
+                if (overrideUserAgent != null) {
+                    settings.setUserAgentString(overrideUserAgent);
+                }
+                if (appendUserAgent != null) {
+                    settings.setUserAgentString(settings.getUserAgentString() + appendUserAgent);
+                }
+
+                //Toggle whether this is enabled or not!
+                Bundle appSettings = cordova.getActivity().getIntent().getExtras();
+                boolean enableDatabase = appSettings == null ? true : appSettings.getBoolean("InAppBrowserStorageEnabled", true);
+                if (enableDatabase) {
+                    String databasePath = cordova.getActivity().getApplicationContext().getDir("inAppBrowserDB", Context.MODE_PRIVATE).getPath();
+                    settings.setDatabasePath(databasePath);
+                    settings.setDatabaseEnabled(true);
+                }
+                settings.setDomStorageEnabled(true);
+
+                if (clearAllCache) {
+                    CookieManager.getInstance().removeAllCookie();
+                } else if (clearSessionCache) {
+                    CookieManager.getInstance().removeSessionCookie();
+                }
+
+                inAppWebView.postUrl(url, postData);
+                inAppWebView.setId(Integer.valueOf(6));
+                inAppWebView.getSettings().setLoadWithOverviewMode(true);
+                inAppWebView.getSettings().setUseWideViewPort(true);
+                inAppWebView.requestFocus();
+                inAppWebView.requestFocusFromTouch();
+
+                // Add the back and forward buttons to our action button container layout
+                actionButtonContainer.addView(back);
+                actionButtonContainer.addView(forward);
+
+                // Add the views to our toolbar
+                toolbar.addView(actionButtonContainer);
+                toolbar.addView(edittext);
+                toolbar.addView(close);
+
+                // Don't add the toolbar if its been disabled
+                if (getShowLocationBar()) {
+                    // Add our toolbar to our main view/layout
+                    main.addView(toolbar);
+                }
+
+                // Add our webview to our main view/layout
+                main.addView(inAppWebView);
+
+                WindowManager.LayoutParams lp = new WindowManager.LayoutParams();
+                lp.copyFrom(dialog.getWindow().getAttributes());
+                lp.width = WindowManager.LayoutParams.MATCH_PARENT;
+                lp.height = WindowManager.LayoutParams.MATCH_PARENT;
+
+                dialog.setContentView(main);
+                dialog.show();
+                dialog.getWindow().setAttributes(lp);
+                // the goal of openhidden is to load the url and not display it
+                // Show() needs to be called to cause the URL to be loaded
+                if(openWindowHidden) {
+                    dialog.hide();
+                }
+            }
+        };
+        this.cordova.getActivity().runOnUiThread(runnable);
+        return "";
+    }
+
 
     /**
      * Create a new plugin success result and send it back to JavaScript
